@@ -360,11 +360,66 @@ class LTX2VideoDecoder(nn.Module):
             )
             self.last_scale_shift_table = mx.zeros((2, last_ch))
 
-    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        # Build decoder weights dict with key remapping
+    def _sanitize_diffusers(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        """Remap HF diffusers-format decoder weights to MLX format.
+
+        HF layout: mid_block.resnets.N + up_blocks.B.resnets.N / up_blocks.B.upsamplers.0
+        MLX layout: up_blocks flattened — [mid_res, upsample, res, upsample, res, ...]
+        """
+        import re
+
         sanitized = {}
+        # Count HF up_blocks to build the index mapping
+        hf_block_ids = sorted(
+            {int(m.group(1)) for k in weights
+             if (m := re.match(r"up_blocks\.(\d+)\.", k))}
+        )
+        # MLX block index: mid_block -> 0, then for each HF block: res -> 2*i+2, upsample -> 2*i+1
+        for key, value in weights.items():
+            new_key = key
+
+            # mid_block.resnets.N -> up_blocks.0.res_blocks.N
+            if new_key.startswith("mid_block.resnets."):
+                new_key = new_key.replace("mid_block.resnets.", "up_blocks.0.res_blocks.")
+
+            # up_blocks.B.upsamplers.0.X -> up_blocks.(2*B+1).X
+            m = re.match(r"up_blocks\.(\d+)\.upsamplers\.0\.(.*)", new_key)
+            if m:
+                hf_idx = int(m.group(1))
+                mlx_idx = 2 * hf_idx + 1
+                new_key = f"up_blocks.{mlx_idx}.{m.group(2)}"
+            else:
+                # up_blocks.B.resnets.N -> up_blocks.(2*B+2).res_blocks.N
+                m = re.match(r"up_blocks\.(\d+)\.resnets\.(.*)", new_key)
+                if m:
+                    hf_idx = int(m.group(1))
+                    mlx_idx = 2 * hf_idx + 2
+                    new_key = f"up_blocks.{mlx_idx}.res_blocks.{m.group(2)}"
+
+            # .conv.weight/.conv.bias -> .conv.conv.weight/.conv.conv.bias
+            if ".conv.weight" in new_key or ".conv.bias" in new_key:
+                if ".conv.conv." not in new_key:
+                    new_key = new_key.replace(".conv.weight", ".conv.conv.weight")
+                    new_key = new_key.replace(".conv.bias", ".conv.conv.bias")
+
+            # Transpose Conv3d weights: (O, I, D, H, W) -> (O, D, H, W, I)
+            if ".conv.weight" in key and value.ndim == 5:
+                value = mx.transpose(value, (0, 2, 3, 4, 1))
+
+            sanitized[new_key] = value
+        return sanitized
+
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        # HF diffusers format: has mid_block, no vae. prefix
+        if any(k.startswith("mid_block.") for k in weights):
+            return self._sanitize_diffusers(weights)
+
+        # Already in MLX format
         if "per_channel_statistics.mean" in weights:
             return weights
+
+        # Raw converted format: has vae. prefix
+        sanitized = {}
         for key, value in weights.items():
             new_key = key
 
@@ -372,30 +427,21 @@ class LTX2VideoDecoder(nn.Module):
                 continue
 
             if key.startswith("vae.per_channel_statistics."):
-                # Map per-channel statistics (use exact key matching)
                 if key == "vae.per_channel_statistics.mean-of-means":
                     new_key = "per_channel_statistics.mean"
                 elif key == "vae.per_channel_statistics.std-of-means":
                     new_key = "per_channel_statistics.std"
                 else:
-                    continue  # Skip other statistics keys
+                    continue
 
             if key.startswith("vae.decoder."):
                 new_key = key.replace("vae.decoder.", "")
 
-            # Handle Conv3d weight transpose: (O, I, D, H, W) -> (O, D, H, W, I)
             if ".conv.weight" in key and value.ndim == 5:
                 value = mx.transpose(value, (0, 2, 3, 4, 1))
 
-            if ".conv.bias" in key:
-                pass  # bias doesn't need transpose
-
             if ".conv.weight" in new_key or ".conv.bias" in new_key:
-
-                if (
-                    ".conv.conv.weight" not in new_key
-                    and ".conv.conv.bias" not in new_key
-                ):
+                if ".conv.conv." not in new_key:
                     new_key = new_key.replace(".conv.weight", ".conv.conv.weight")
                     new_key = new_key.replace(".conv.bias", ".conv.conv.bias")
 
@@ -420,6 +466,13 @@ class LTX2VideoDecoder(nn.Module):
 
         model_path = Path(model_path)
         config_dict = {}
+        component_prefix = None
+
+        # If the path doesn't exist, try loading from combined parent file
+        if not model_path.exists():
+            parent = model_path.parent
+            component_prefix = model_path.name + "."
+            model_path = parent
 
         # Load config from directory
         config_path = model_path / "config.json"
@@ -435,11 +488,25 @@ class LTX2VideoDecoder(nn.Module):
         for wf in weight_files:
             weights.update(mx.load(str(wf)))
 
+        if component_prefix:
+            filtered = {}
+            for k, v in weights.items():
+                if k.startswith(component_prefix):
+                    filtered[k[len(component_prefix):]] = v
+                elif k == "latents_mean":
+                    filtered["per_channel_statistics.mean"] = v.squeeze()
+                elif k == "latents_std":
+                    filtered["per_channel_statistics.std"] = v.squeeze()
+            weights = filtered
+
         # Infer block structure from weights
         decoder_blocks = cls._infer_blocks(weights)
 
         # Determine spatial padding mode from config
-        spatial_padding_mode_str = config_dict.get("spatial_padding_mode", "reflect")
+        spatial_padding_mode_str = config_dict.get(
+            "spatial_padding_mode",
+            config_dict.get("decoder_spatial_padding_mode", "reflect"),
+        )
         spatial_padding_mode = PaddingModeType(spatial_padding_mode_str)
 
         model = cls(

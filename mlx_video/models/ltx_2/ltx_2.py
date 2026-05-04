@@ -628,55 +628,86 @@ class LTXModel(nn.Module):
 
         return vx, ax
 
+    def _apply_key_mappings(self, key: str) -> str:
+        key = key.replace(".to_out.0.", ".to_out.")
+        key = key.replace(".ff.net.0.proj.", ".ff.proj_in.")
+        key = key.replace(".ff.net.2.", ".ff.proj_out.")
+        key = key.replace(".audio_ff.net.0.proj.", ".audio_ff.proj_in.")
+        key = key.replace(".audio_ff.net.2.", ".audio_ff.proj_out.")
+        key = key.replace(".linear_1.", ".linear1.")
+        key = key.replace(".linear_2.", ".linear2.")
+        key = key.replace(".norm_q.", ".q_norm.")
+        key = key.replace(".norm_k.", ".k_norm.")
+        key = key.replace(
+            ".audio_a2v_cross_attn_scale_shift_table",
+            ".scale_shift_table_a2v_ca_audio",
+        )
+        key = key.replace(
+            ".video_a2v_cross_attn_scale_shift_table",
+            ".scale_shift_table_a2v_ca_video",
+        )
+        return key
+
+    def _apply_toplevel_mappings(self, key: str) -> str:
+        mappings = [
+            ("av_cross_attn_audio_scale_shift.", "av_ca_audio_scale_shift_adaln_single."),
+            ("av_cross_attn_video_scale_shift.", "av_ca_video_scale_shift_adaln_single."),
+            ("av_cross_attn_audio_v2a_gate.", "av_ca_v2a_gate_adaln_single."),
+            ("av_cross_attn_video_a2v_gate.", "av_ca_a2v_gate_adaln_single."),
+            ("audio_time_embed.", "audio_adaln_single."),
+            ("time_embed.", "adaln_single."),
+            ("audio_proj_in.", "audio_patchify_proj."),
+            ("proj_in.", "patchify_proj."),
+        ]
+        for old, new in mappings:
+            if key.startswith(old):
+                return new + key[len(old):]
+        return key
+
     def sanitize(self, weights: dict) -> dict:
         sanitized = {}
 
         has_raw_prefix = any(k.startswith("model.diffusion_model.") for k in weights)
-        if not has_raw_prefix:
-            return weights
 
         for key, value in weights.items():
-            new_key = key
+            if has_raw_prefix:
+                if not key.startswith("model.diffusion_model."):
+                    continue
+                if (
+                    "audio_embeddings_connector" in key
+                    or "video_embeddings_connector" in key
+                ):
+                    continue
+                key = key.replace("model.diffusion_model.", "")
 
-            if not key.startswith("model.diffusion_model."):
-                continue
-            if (
-                "audio_embeddings_connector" in key
-                or "video_embeddings_connector" in key
-            ):
-                continue
-
-            # Remove 'model.diffusion_model.' prefix
-            new_key = new_key.replace("model.diffusion_model.", "")
-
-            new_key = new_key.replace(".to_out.0.", ".to_out.")
-
-            new_key = new_key.replace(".ff.net.0.proj.", ".ff.proj_in.")
-            new_key = new_key.replace(".ff.net.2.", ".ff.proj_out.")
-            new_key = new_key.replace(".audio_ff.net.0.proj.", ".audio_ff.proj_in.")
-            new_key = new_key.replace(".audio_ff.net.2.", ".audio_ff.proj_out.")
-
-            new_key = new_key.replace(".linear_1.", ".linear1.")
-            new_key = new_key.replace(".linear_2.", ".linear2.")
-
+            new_key = self._apply_key_mappings(key)
+            new_key = self._apply_toplevel_mappings(new_key)
             sanitized[new_key] = value
 
         return sanitized
 
     @classmethod
-    def from_pretrained(cls, model_path: Path, strict: bool = True) -> "LTXModel":
+    def from_pretrained(
+        cls,
+        model_path: Path,
+        strict: bool = True,
+        weights_file: Optional[Path] = None,
+    ) -> "LTXModel":
         import json
 
         config_dict = {}
         with open(model_path / "config.json", "r") as f:
             config_dict = json.load(f)
-        config = LTXModelConfig(**config_dict)
+        config = LTXModelConfig.from_dict(config_dict)
         model = cls(config)
 
         weights = {}
 
-        for weight_file in model_path.glob("*.safetensors"):
-            weights.update(mx.load(str(weight_file)))
+        if weights_file is not None:
+            weights.update(mx.load(str(weights_file)))
+        else:
+            for weight_file in model_path.glob("*.safetensors"):
+                weights.update(mx.load(str(weight_file)))
 
         sanitized = model.sanitize(weights)
         sanitized = {

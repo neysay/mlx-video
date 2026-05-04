@@ -427,12 +427,20 @@ class VideoEncoder(nn.Module):
 
         from mlx_video.models.ltx_2.config import VideoEncoderModelConfig
 
+        model_path = Path(model_path)
+        component_prefix = None
+
+        if not model_path.exists():
+            parent = model_path.parent
+            component_prefix = model_path.name + "."
+            model_path = parent
+
         # Load config
         config_path = model_path / "config.json"
         if config_path.exists():
             with open(config_path) as f:
                 config_dict = json.load(f)
-            config = VideoEncoderModelConfig(**config_dict)
+            config = VideoEncoderModelConfig.from_dict(config_dict)
         else:
             config = VideoEncoderModelConfig()
 
@@ -447,6 +455,13 @@ class VideoEncoder(nn.Module):
             weights = {}
             for wf in weight_files:
                 weights.update(mx.load(str(wf)))
+
+        if component_prefix:
+            weights = {
+                k[len(component_prefix):]: v
+                for k, v in weights.items()
+                if k.startswith(component_prefix)
+            }
 
         # Create model, sanitize and load weights
         model = cls(config)

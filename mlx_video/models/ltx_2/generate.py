@@ -1668,6 +1668,22 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
         return False
 
 
+import re
+
+_MONOLITHIC_PATTERN = re.compile(
+    r"^ltx-[\d.]+-\d+b-(?P<variant>distilled|dev)\.safetensors$"
+)
+
+
+def _find_raw_checkpoint(model_path: Path, variant: str) -> Optional[Path]:
+    """Find the monolithic raw checkpoint for a specific variant (distilled/dev)."""
+    for f in sorted(model_path.glob("*.safetensors")):
+        m = _MONOLITHIC_PATTERN.match(f.name)
+        if m and m.group("variant") == variant:
+            return f
+    return None
+
+
 # =============================================================================
 # Unified Generate Function
 # =============================================================================
@@ -1938,14 +1954,21 @@ def generate_video(
     del text_encoder
     mx.clear_cache()
 
-    # Load transformer
+    # Load transformer — use variant-specific raw checkpoint when available
+    variant = "distilled" if pipeline in (PipelineType.DISTILLED,) else "dev"
+    raw_checkpoint = _find_raw_checkpoint(model_path, variant)
     transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
     with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
         transformer = LTXModel.from_pretrained(
-            model_path=model_path / "transformer", strict=True
+            model_path=model_path / "transformer",
+            strict=True,
+            weights_file=raw_checkpoint,
         )
 
-    console.print("[green]✓[/] Transformer loaded")
+    if raw_checkpoint:
+        console.print(f"[green]✓[/] Transformer loaded ({raw_checkpoint.name})")
+    else:
+        console.print("[green]✓[/] Transformer loaded")
 
     # Auto-detect stg_blocks from transformer config if not explicitly provided.
     # LTX-2.3 (has_prompt_adaln=True) uses block 28; LTX-2 uses block 29.
