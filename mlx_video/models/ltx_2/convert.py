@@ -540,20 +540,46 @@ def infer_vae_decoder_config(weights: Dict[str, mx.array], variant: str) -> dict
 
 
 def infer_vae_encoder_config(weights: Dict[str, mx.array]) -> dict:
-    """Return VAE encoder config (architecture is consistent across versions)."""
+    """Infer VAE encoder config from weight shapes.
+
+    Block types and order are consistent across LTX versions.
+    Multipliers and layer counts are inferred from the weights.
+    """
+    # Block layout: (index, type, stride_product)
+    # res_x blocks use res_blocks keys; compress blocks use a single conv key
+    block_layout = [
+        (0, "res_x"),
+        (1, "compress_space_res", 4),   # stride (1,2,2)
+        (2, "res_x"),
+        (3, "compress_time_res", 2),    # stride (2,1,1)
+        (4, "res_x"),
+        (5, "compress_all_res", 8),     # stride (2,2,2)
+        (6, "res_x"),
+        (7, "compress_all_res", 8),     # stride (2,2,2)
+        (8, "res_x"),
+    ]
+
+    encoder_blocks = []
+    for entry in block_layout:
+        idx, block_type = entry[0], entry[1]
+        if block_type == "res_x":
+            num_layers = sum(
+                1 for k in weights if k.startswith(f"down_blocks.{idx}.res_blocks.")
+                and k.endswith(".conv1.conv.weight")
+            )
+            encoder_blocks.append(["res_x", {"num_layers": num_layers}])
+        else:
+            stride_product = entry[2]
+            w = weights.get(f"down_blocks.{idx}.conv.conv.weight")
+            in_channels = w.shape[-1]
+            conv_out_channels = w.shape[0]
+            out_channels = conv_out_channels * stride_product
+            multiplier = out_channels // in_channels
+            encoder_blocks.append([block_type, {"multiplier": multiplier}])
+
     return {
         "convolution_dimensions": 3,
-        "encoder_blocks": [
-            ["res_x", {"num_layers": 4}],
-            ["compress_space_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 6}],
-            ["compress_time_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 6}],
-            ["compress_all_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 2}],
-            ["compress_all_res", {"multiplier": 2}],
-            ["res_x", {"num_layers": 2}],
-        ],
+        "encoder_blocks": encoder_blocks,
         "encoder_spatial_padding_mode": "zeros",
         "in_channels": 3,
         "latent_log_var": "uniform",

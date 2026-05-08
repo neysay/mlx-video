@@ -6,6 +6,7 @@ Supports both distilled (two-stage with upsampling) and dev (single-stage with C
 import argparse
 import math
 import time
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,8 @@ from rich.progress import (
 
 # Rich console for styled output
 console = Console()
+
+ProgressCallback = Callable[[int, int, str], None] | None
 
 
 from mlx_video.models.ltx_2.conditioning import (
@@ -483,6 +486,8 @@ def denoise_distilled(
     audio_positions: Optional[mx.array] = None,
     audio_embeddings: Optional[mx.array] = None,
     audio_frozen: bool = False,
+    progress_callback: ProgressCallback = None,
+    callback_stage: str = "denoise",
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG)."""
     dtype = latents.dtype
@@ -616,6 +621,8 @@ def denoise_distilled(
                 mx.eval(audio_latents)
 
             progress.advance(task)
+            if progress_callback:
+                progress_callback(i + 1, num_steps, callback_stage)
 
     return latents.astype(dtype), audio_latents.astype(dtype) if enable_audio else None
 
@@ -641,6 +648,8 @@ def denoise_dev(
     apg_norm_threshold: float = 0.0,
     stg_scale: float = 0.0,
     stg_blocks: Optional[list] = None,
+    progress_callback: ProgressCallback = None,
+    callback_stage: str = "denoise",
 ) -> mx.array:
     """Run denoising loop for dev pipeline with CFG/APG and optional STG guidance.
 
@@ -826,6 +835,8 @@ def denoise_dev(
 
             mx.eval(latents)
             progress.advance(task)
+            if progress_callback:
+                progress_callback(i + 1, num_steps, callback_stage)
 
     return latents.astype(dtype)
 
@@ -854,6 +865,8 @@ def denoise_dev_av(
     stg_audio_blocks: Optional[list] = None,
     modality_scale: float = 1.0,
     audio_frozen: bool = False,
+    progress_callback: ProgressCallback = None,
+    callback_stage: str = "denoise",
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG/APG, STG, modality guidance, and audio.
 
@@ -1173,6 +1186,8 @@ def denoise_dev_av(
 
             mx.eval(video_latents, audio_latents)
             progress.advance(task)
+            if progress_callback:
+                progress_callback(i + 1, num_steps, callback_stage)
 
     return video_latents, audio_latents
 
@@ -1202,6 +1217,8 @@ def denoise_res2s_av(
     bongmath: bool = True,
     bongmath_max_iter: int = 100,
     audio_frozen: bool = False,
+    progress_callback: ProgressCallback = None,
+    callback_stage: str = "denoise",
 ) -> tuple[mx.array, mx.array]:
     """Run res_2s second-order denoising loop with CFG/STG/modality guidance.
 
@@ -1583,6 +1600,8 @@ def denoise_res2s_av(
 
             mx.eval(video_latents, audio_latents)
             progress.advance(task)
+            if progress_callback:
+                progress_callback(step_idx + 1, n_full_steps, callback_stage)
 
     # Final clean step if original schedule ended at 0
     if sigmas.tolist()[-1] == 0:
@@ -1730,6 +1749,7 @@ def generate_video(
     audio_file: Optional[str] = None,
     audio_start_time: float = 0.0,
     spatial_upscaler: Optional[str] = None,
+    progress_callback: ProgressCallback = None,
 ):
     """Generate video using LTX-2 models.
 
@@ -1897,6 +1917,8 @@ def generate_video(
             has_prompt_adaln = json.load(f).get("has_prompt_adaln", False)
 
     # Load text encoder
+    if progress_callback:
+        progress_callback(0, 0, "loading_text_encoder")
     with console.status("[blue]📝 Loading text encoder...[/]", spinner="dots"):
         from mlx_video.models.ltx_2.text_encoder import LTX2TextEncoder
 
@@ -1957,6 +1979,8 @@ def generate_video(
     # Load transformer — use variant-specific raw checkpoint when available
     variant = "distilled" if pipeline in (PipelineType.DISTILLED,) else "dev"
     raw_checkpoint = _find_raw_checkpoint(model_path, variant)
+    if progress_callback:
+        progress_callback(0, 0, "loading_transformer")
     transformer_desc = f"🤖 Loading {pipeline_name.lower()} transformer{' (A/V mode)' if audio else ''}..."
     with console.status(f"[blue]{transformer_desc}[/]", spinner="dots"):
         transformer = LTXModel.from_pretrained(
@@ -2165,6 +2189,8 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="stage1_denoise",
         )
 
         # Upsample latents
@@ -2253,6 +2279,8 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="stage2_denoise",
         )
 
     elif pipeline == PipelineType.DEV:
@@ -2364,6 +2392,8 @@ def generate_video(
             stg_audio_blocks=stg_blocks,
             modality_scale=modality_scale,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="denoise",
         )
 
         # Load VAE decoder (for dev pipeline, loaded here instead of during upsampling)
@@ -2495,6 +2525,8 @@ def generate_video(
             stg_audio_blocks=stg_blocks,
             modality_scale=modality_scale,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="stage1_denoise",
         )
 
         mx.eval(audio_latents)
@@ -2605,6 +2637,8 @@ def generate_video(
             audio_positions=audio_positions,
             audio_embeddings=audio_embeddings_pos,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="stage2_denoise",
         )
 
     elif pipeline == PipelineType.DEV_TWO_STAGE_HQ:
@@ -2770,6 +2804,8 @@ def generate_video(
             modality_scale=modality_scale,
             noise_seed=seed,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="stage1_denoise",
         )
 
         mx.eval(audio_latents)
@@ -2879,6 +2915,8 @@ def generate_video(
             video_state=state2,
             noise_seed=seed + 1,
             audio_frozen=is_a2v,
+            progress_callback=progress_callback,
+            callback_stage="stage2_denoise",
         )
 
     del transformer
@@ -2888,6 +2926,8 @@ def generate_video(
     # Decode and save outputs (common to both pipelines)
     # ==========================================================================
 
+    if progress_callback:
+        progress_callback(0, 0, "vae_decode")
     console.print("\n[blue]🎞️  Decoding video...[/]")
 
     # Select tiling configuration
@@ -3016,6 +3056,8 @@ def generate_video(
     audio_np = None
     vocoder_sample_rate = AUDIO_SAMPLE_RATE
     if audio and audio_latents is not None:
+        if progress_callback:
+            progress_callback(0, 0, "audio_decode")
         if is_a2v and a2v_waveform is not None:
             # A2V: use original input audio waveform (no VAE decoding needed)
             audio_np = a2v_waveform
