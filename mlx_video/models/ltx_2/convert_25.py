@@ -219,14 +219,65 @@ def audio_configs_from_metadata(meta_config: dict) -> tuple[dict, dict, dict]:
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
-def convert_25(source: str, output_path: Path, variant: str = "distilled") -> None:
+def convert_25_shared(encoder_file: Path, shared_dir: Path) -> None:
+    """Convert the Gemma-4 encoder file into a shared component.
+
+    Produces ``text_encoder-2.5/`` (weights + config), ``tokenizer-2.5/``
+    (materialized packed assets), and ``text_projections-2.5.safetensors``
+    (the aggregate-embed projections, which ship in the encoder file and are
+    shared across variants -- unlike the connectors, which ship per-variant
+    inside each transformer file).
+    """
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[shared] Text encoder: {encoder_file.name}")
+    encoder_meta = read_metadata(encoder_file)
+    gemma_config = json.loads(encoder_meta["gemma_config"])
+    weights = mx.load(str(encoder_file))
+    gemma_weights, assets = split_text_encoder(weights)
+    save_sharded(gemma_weights, shared_dir / "text_encoder-2.5")
+    save_config(gemma_config, shared_dir / "text_encoder-2.5")
+    tokenizer_dir = shared_dir / "tokenizer-2.5"
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    for name, payload in assets.items():
+        (tokenizer_dir / name).write_bytes(payload)
+    aggregates = extract_text_projections(weights)
+    mx.save_safetensors(
+        str(shared_dir / "text_projections-2.5.safetensors"), aggregates
+    )
+    print(
+        f"    {len(gemma_weights)} gemma keys, {len(assets)} tokenizer assets, "
+        f"{len(aggregates)} aggregate projections"
+    )
+
+
+def _link(link: Path, target: Path) -> None:
+    if link.is_symlink() or link.is_file():
+        link.unlink()
+    elif link.is_dir():
+        shutil.rmtree(link)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+
+
+def convert_25(
+    source: str,
+    output_path: Path,
+    variant: str = "distilled",
+    shared_dir: "Path | None" = None,
+) -> None:
+    """Convert an LTX-2.5 variant. With ``shared_dir``, the Gemma-4 encoder,
+    tokenizer, and aggregate projections are expected as a shared component
+    there (see :func:`convert_25_shared`) and symlinked in; without it the
+    output directory is fully self-contained."""
     source_dir = Path(source)
     output_path.mkdir(parents=True, exist_ok=True)
 
     transformer_file = find_component(
         source_dir, [f"ltx-2.5-*-{variant}-transformer-*.safetensors"]
     )
-    encoder_file = find_component(source_dir, ["gemma4-*-with-proj-*.safetensors"])
+    encoder_file = None
+    if shared_dir is None:
+        encoder_file = find_component(source_dir, ["gemma4-*-with-proj-*.safetensors"])
     video_vae_file = find_component(source_dir, ["ltx-2.5-video-vae-conv-*.safetensors"])
     audio_vae_file = find_component(source_dir, ["ltx-2.5-audio-vae-*.safetensors"])
 
@@ -246,30 +297,41 @@ def convert_25(source: str, output_path: Path, variant: str = "distilled") -> No
     del weights, transformer_weights
 
     # 2. Text encoder (Gemma 4) + tokenizer assets + projections
-    print(f"[2/5] Text encoder: {encoder_file.name}")
-    encoder_meta = read_metadata(encoder_file)
-    gemma_config = json.loads(encoder_meta["gemma_config"])
-    weights = mx.load(str(encoder_file))
-    gemma_weights, assets = split_text_encoder(weights)
-    save_sharded(gemma_weights, output_path / "text_encoder")
-    save_config(gemma_config, output_path / "text_encoder")
-    tokenizer_dir = output_path / "tokenizer"
-    tokenizer_dir.mkdir(parents=True, exist_ok=True)
-    for name, payload in assets.items():
-        (tokenizer_dir / name).write_bytes(payload)
-        print(f"    tokenizer asset: {name} ({len(payload)} bytes)")
-    projection_weights = dict(connector_weights)
-    projection_weights.update(
-        extract_text_projections(weights)
-    )  # aggregate embeds live here
     tp_dir = output_path / "text_projections"
     tp_dir.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(str(tp_dir / "model.safetensors"), projection_weights)
-    print(
-        f"    {len(gemma_weights)} gemma keys, "
-        f"{len(projection_weights)} projection keys"
-    )
-    del weights, gemma_weights
+    if shared_dir is not None:
+        print("[2/5] Text encoder: linking shared component")
+        _link(output_path / "text_encoder", shared_dir / "text_encoder-2.5")
+        _link(output_path / "tokenizer", shared_dir / "tokenizer-2.5")
+        _link(
+            tp_dir / "aggregate.safetensors",
+            shared_dir / "text_projections-2.5.safetensors",
+        )
+        mx.save_safetensors(str(tp_dir / "model.safetensors"), connector_weights)
+        print(f"    {len(connector_weights)} per-variant connector keys")
+    else:
+        print(f"[2/5] Text encoder: {encoder_file.name}")
+        encoder_meta = read_metadata(encoder_file)
+        gemma_config = json.loads(encoder_meta["gemma_config"])
+        weights = mx.load(str(encoder_file))
+        gemma_weights, assets = split_text_encoder(weights)
+        save_sharded(gemma_weights, output_path / "text_encoder")
+        save_config(gemma_config, output_path / "text_encoder")
+        tokenizer_dir = output_path / "tokenizer"
+        tokenizer_dir.mkdir(parents=True, exist_ok=True)
+        for name, payload in assets.items():
+            (tokenizer_dir / name).write_bytes(payload)
+            print(f"    tokenizer asset: {name} ({len(payload)} bytes)")
+        projection_weights = dict(connector_weights)
+        projection_weights.update(
+            extract_text_projections(weights)
+        )  # aggregate embeds live here
+        mx.save_safetensors(str(tp_dir / "model.safetensors"), projection_weights)
+        print(
+            f"    {len(gemma_weights)} gemma keys, "
+            f"{len(projection_weights)} projection keys"
+        )
+        del weights, gemma_weights
 
     # 3. Video VAE (conv variant)
     print(f"[3/5] Video VAE: {video_vae_file.name}")
@@ -332,5 +394,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--variant", choices=["distilled", "dev"], default="distilled"
     )
+    parser.add_argument(
+        "--shared-dir",
+        default=None,
+        help="Directory holding (or to hold) the shared Gemma-4 component; "
+        "the model dir links it instead of bundling its own copy",
+    )
     args = parser.parse_args()
-    convert_25(args.source, Path(args.output), variant=args.variant)
+    shared = Path(args.shared_dir) if args.shared_dir else None
+    if shared is not None and not (shared / "text_encoder-2.5").is_dir():
+        encoder = find_component(
+            Path(args.source), ["gemma4-*-with-proj-*.safetensors"]
+        )
+        convert_25_shared(encoder, shared)
+    convert_25(args.source, Path(args.output), variant=args.variant, shared_dir=shared)
