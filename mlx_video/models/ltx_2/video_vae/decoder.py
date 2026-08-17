@@ -499,8 +499,13 @@ class LTX2VideoDecoder(nn.Module):
                     filtered["per_channel_statistics.std"] = v.squeeze()
             weights = filtered
 
-        # Infer block structure from weights
-        decoder_blocks = cls._infer_blocks(weights)
+        # Prefer the checkpoint's own topology (LTX-2.5 configs carry
+        # decoder_blocks verbatim); fall back to weight-shape inference for
+        # older conversions whose configs lack it.
+        if config_dict.get("decoder_blocks"):
+            decoder_blocks = cls._blocks_from_config(config_dict)
+        else:
+            decoder_blocks = cls._infer_blocks(weights)
 
         # Determine spatial padding mode from config
         spatial_padding_mode_str = config_dict.get(
@@ -517,6 +522,52 @@ class LTX2VideoDecoder(nn.Module):
         weights = model.sanitize(weights)
         model.load_weights(list(weights.items()), strict=strict)
         return model
+
+    @staticmethod
+    def _blocks_from_config(config_dict: dict) -> list:
+        """Build the internal block list from the checkpoint's own config.
+
+        The reference applies ``decoder_blocks`` in reverse for decoding;
+        the channel ladder starts at base * prod(multipliers) (the encoder
+        bottleneck) and divides by each compress block's multiplier.
+
+        Config beats weight-shape sniffing here: LTX-2.5 ships a
+        channel-preserving ``compress_all {multiplier: 1}`` stage that
+        ratio-based inference misreads.
+        """
+        strides = {
+            "compress_space": (1, 2, 2),
+            "compress_time": (2, 1, 1),
+            "compress_all": (2, 2, 2),
+        }
+        base = int(config_dict.get("decoder_base_channels", 128))
+        entries = [
+            (name, dict(params)) for name, params in config_dict["decoder_blocks"]
+        ]
+        channels = base
+        for name, params in entries:
+            if name in strides:
+                channels *= int(params.get("multiplier", 2))
+
+        blocks = []
+        for name, params in reversed(entries):
+            if name == "res_x":
+                blocks.append(("res", channels, int(params.get("num_layers", 2))))
+            elif name in strides:
+                reduction = int(params.get("multiplier", 2))
+                blocks.append(
+                    (
+                        "d2s",
+                        channels,
+                        reduction,
+                        strides[name],
+                        bool(params.get("residual", False)),
+                    )
+                )
+                channels //= reduction
+            else:
+                raise ValueError(f"unsupported decoder block type {name!r}")
+        return blocks
 
     @staticmethod
     def _infer_blocks(weights: dict) -> list:
@@ -692,6 +743,7 @@ class LTX2VideoDecoder(nn.Module):
         timestep: Optional[mx.array] = None,
         debug: bool = False,
         on_frames_ready: Optional[callable] = None,
+        on_tile_done: Optional[callable] = None,
     ) -> mx.array:
         """Decode latents using tiling to reduce memory usage.
 
@@ -764,6 +816,7 @@ class LTX2VideoDecoder(nn.Module):
             timestep=timestep,
             chunked_conv=use_chunked_conv,
             on_frames_ready=on_frames_ready,
+            on_tile_done=on_tile_done,
         )
 
 

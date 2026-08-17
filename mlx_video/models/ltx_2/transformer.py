@@ -56,6 +56,8 @@ class BasicAVTransformerBlock(nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
         has_prompt_adaln: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
     ):
         super().__init__()
 
@@ -83,7 +85,7 @@ class BasicAVTransformerBlock(nn.Module):
                 norm_eps=norm_eps,
                 has_gate_logits=has_prompt_adaln,
             )
-            self.ff = FeedForward(video.dim, dim_out=video.dim)
+            self.ff = FeedForward(video.dim, dim_out=video.dim, bias=ff_bias)
             # 9 params for LTX-2.3 (self-attn + cross-attn + FFN), 6 for LTX-2
             num_ada_params = 9 if has_prompt_adaln else 6
             self.scale_shift_table = mx.zeros((num_ada_params, video.dim))
@@ -111,7 +113,7 @@ class BasicAVTransformerBlock(nn.Module):
                 norm_eps=norm_eps,
                 has_gate_logits=has_prompt_adaln,
             )
-            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
+            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim, bias=audio_ff_bias)
             num_audio_ada_params = 9 if has_prompt_adaln else 6
             self.audio_scale_shift_table = mx.zeros((num_audio_ada_params, audio.dim))
 

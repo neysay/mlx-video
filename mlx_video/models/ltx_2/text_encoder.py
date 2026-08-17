@@ -218,6 +218,42 @@ class LanguageModel(nn.Module):
         return language_model
 
 
+def _load_language_model(text_encoder_path: str):
+    """Instantiate the right text tower for the checkpoint at hand.
+
+    Gemma 4 ("gemma4*" model_type, LTX-2.5) loads the vendored MLX port;
+    everything else keeps the mlx-vlm Gemma-3 path unchanged.
+    """
+    import json as _json
+
+    config_file = Path(str(text_encoder_path)) / "config.json"
+    model_type = ""
+    if config_file.exists():
+        with open(config_file) as f:
+            config_dict = _json.load(f)
+        model_type = (
+            config_dict.get("model_type")
+            or config_dict.get("text_config", {}).get("model_type", "")
+        )
+    if str(model_type).startswith("gemma4"):
+        from mlx_video.models.ltx_2.gemma4 import (
+            Gemma4LanguageModel,
+            Gemma4TextConfig,
+        )
+
+        text_config = config_dict.get("text_config", config_dict)
+        model = Gemma4LanguageModel(Gemma4TextConfig.from_hf(text_config))
+        weights = {}
+        for wf in sorted(Path(str(text_encoder_path)).glob("*.safetensors")):
+            weights.update(mx.load(str(wf)))
+        weights = model.sanitize(weights)
+        model.load_weights(list(weights.items()), strict=True)
+        mx.eval(model.parameters())
+        model.eval()
+        return model
+    return LanguageModel.from_pretrained(text_encoder_path)
+
+
 class ConnectorAttention(nn.Module):
 
     def __init__(
@@ -836,7 +872,9 @@ class LTX2TextEncoder(nn.Module):
         if Path(str(text_encoder_path)).joinpath("text_encoder").is_dir():
             text_encoder_path = str(Path(text_encoder_path) / "text_encoder")
 
-        self.language_model = LanguageModel.from_pretrained(text_encoder_path)
+        # LTX-2.5 ships a Gemma-4 encoder ("gemma4_unified_text"); earlier
+        # models use Gemma 3. Dispatch on the converted config's model_type.
+        self.language_model = _load_language_model(text_encoder_path)
 
         # Load transformer weights for feature extractor and connector.
         # These weights are stored differently depending on the repo format:

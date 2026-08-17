@@ -327,6 +327,7 @@ def decode_with_tiling(
     timestep: Optional[mx.array] = None,
     chunked_conv: bool = False,
     on_frames_ready: Optional[Callable[[mx.array, int], None]] = None,
+    on_tile_done: Optional[Callable[[int, int], None]] = None,
 ) -> mx.array:
     """Decode latents using tiling to reduce memory usage.
 
@@ -342,6 +343,9 @@ def decode_with_tiling(
         on_frames_ready: Optional callback called with (frames, start_idx) when frames are finalized.
             frames: Tensor of shape (B, 3, num_frames, H, W) with finalized RGB frames.
             start_idx: Starting frame index in the full video.
+        on_tile_done: Optional progress callback called with
+            (tiles_completed, total_tiles) after each tile is decoded and
+            blended -- the natural tick for a live progress bar.
 
     Returns:
         Decoded video.
@@ -526,6 +530,8 @@ def decode_with_tiling(
                 del t_mask_slice, h_mask_slice, w_mask_slice
 
                 tile_idx += 1
+                if on_tile_done is not None:
+                    on_tile_done(tile_idx, total_tiles)
 
                 # Periodic garbage collection and cache clearing
                 if tile_idx % 4 == 0:

@@ -503,9 +503,16 @@ class LTXModel(nn.Module):
                 rope_type=config.rope_type,
                 norm_eps=config.norm_eps,
                 has_prompt_adaln=config.has_prompt_adaln,
+                ff_bias=config.ff_bias,
+                audio_ff_bias=config.audio_ff_bias,
             )
             for idx in range(config.num_layers)
         }
+
+        # LTX-2.5 keyframe-conditioning slot: zero-init keeps it an exact
+        # no-op, but the parameter must exist for the checkpoint to load.
+        if config.use_keyframes_abs_pos_embedding and video_config is not None:
+            self.keyframes_abs_pos_embedding = mx.zeros((1, video_config.dim))
 
     def _process_transformer_blocks(
         self,

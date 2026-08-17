@@ -64,6 +64,23 @@ class PipelineType(Enum):
 STAGE_1_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
 STAGE_2_SIGMAS = [0.909375, 0.725, 0.421875, 0.0]
 
+# LTX-2.5+: distilled stage 1 uses an ancestral (SDE) Euler sampler.
+# Values mirror the reference (ltx-pipelines distilled.py).
+ANCESTRAL_SAMPLER_SINCE = (2, 5)
+ANCESTRAL_ETA = 1.0
+ANCESTRAL_S_NOISE = 1.0
+ANCESTRAL_NOISE_SEED_OFFSET = 10000
+
+
+def arch_at_least(version: str, minimum: tuple) -> bool:
+    """True when an arch_version string like '2.5' is >= minimum. Unknown or
+    absent versions compare False (pre-2.5 behavior)."""
+    try:
+        parts = tuple(int(p) for p in str(version).split("."))
+    except ValueError:
+        return False
+    return bool(parts) and parts >= tuple(minimum)
+
 # Dev model scheduling constants
 BASE_SHIFT_ANCHOR = 1024
 MAX_SHIFT_ANCHOR = 4096
@@ -488,10 +505,18 @@ def denoise_distilled(
     audio_frozen: bool = False,
     progress_callback: ProgressCallback = None,
     callback_stage: str = "denoise",
+    ancestral: bool = False,
+    noise_seed: int = 0,
 ) -> tuple[mx.array, Optional[mx.array]]:
-    """Run denoising loop for distilled pipeline (no CFG)."""
+    """Run denoising loop for distilled pipeline (no CFG).
+
+    With ``ancestral`` (LTX-2.5+ stage 1), each step takes a deterministic
+    Euler step to an intermediate ``sigma_down`` and renoises back up to
+    ``sigma_next`` with fresh seeded noise (video drawn first, then audio),
+    in the rectified-flow parameterization (alpha = 1 - sigma)."""
     dtype = latents.dtype
     enable_audio = audio_latents is not None
+    noise_key = mx.random.key(noise_seed) if ancestral else None
 
     if state is not None:
         latents = state.latent
@@ -604,13 +629,52 @@ def denoise_distilled(
 
             # Euler step in float32
             if sigma_next > 0:
-                sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
-                latents = denoised + sigma_next_f32 * (latents - denoised) / sigma_f32
-                if enable_audio and audio_denoised is not None and not audio_frozen:
-                    audio_latents = (
-                        audio_denoised
-                        + sigma_next_f32 * (audio_latents - audio_denoised) / sigma_f32
+                if ancestral:
+                    # Ancestral step (reference EulerAncestralDiffusionStep,
+                    # eta=1): Euler to sigma_down, then variance-preserving
+                    # renoise back up to sigma_next.
+                    downstep = 1.0 + (sigma_next / sigma - 1.0) * ANCESTRAL_ETA
+                    sigma_down = sigma_next * downstep
+                    ratio = sigma_down / sigma
+                    alpha_next = 1.0 - sigma_next
+                    alpha_down = 1.0 - sigma_down
+                    renoise = (
+                        max(
+                            0.0,
+                            sigma_next**2
+                            - sigma_down**2 * alpha_next**2 / alpha_down**2,
+                        )
+                        ** 0.5
                     )
+                    alpha_ratio = alpha_next / alpha_down
+
+                    def ancestral_step(x, x0, key):
+                        key, sub = mx.random.split(key)
+                        noise = mx.random.normal(x.shape, dtype=mx.float32, key=sub)
+                        x_next = ratio * x + (1.0 - ratio) * x0
+                        return (
+                            alpha_ratio * x_next
+                            + noise * ANCESTRAL_S_NOISE * renoise,
+                            key,
+                        )
+
+                    latents, noise_key = ancestral_step(latents, denoised, noise_key)
+                    if enable_audio and audio_denoised is not None and not audio_frozen:
+                        audio_latents, noise_key = ancestral_step(
+                            audio_latents, audio_denoised, noise_key
+                        )
+                else:
+                    sigma_next_f32 = mx.array(sigma_next, dtype=mx.float32)
+                    latents = (
+                        denoised + sigma_next_f32 * (latents - denoised) / sigma_f32
+                    )
+                    if enable_audio and audio_denoised is not None and not audio_frozen:
+                        audio_latents = (
+                            audio_denoised
+                            + sigma_next_f32
+                            * (audio_latents - audio_denoised)
+                            / sigma_f32
+                        )
             else:
                 latents = denoised
                 if enable_audio and audio_denoised is not None and not audio_frozen:
@@ -2177,6 +2241,14 @@ def generate_video(
             )
             mx.eval(latents)
 
+        # LTX-2.5+ distilled stage 1 is ancestral; earlier models keep the
+        # plain Euler step (reference gates this at exactly (2, 5)).
+        use_ancestral = arch_at_least(
+            transformer.config.arch_version, ANCESTRAL_SAMPLER_SINCE
+        )
+        if use_ancestral and verbose:
+            console.print("[dim]LTX-2.5: ancestral (SDE) Euler for stage 1[/]")
+
         latents, audio_latents = denoise_distilled(
             latents,
             positions,
@@ -2191,6 +2263,8 @@ def generate_video(
             audio_frozen=is_a2v,
             progress_callback=progress_callback,
             callback_stage="stage1_denoise",
+            ancestral=use_ancestral,
+            noise_seed=seed + ANCESTRAL_NOISE_SEED_OFFSET,
         )
 
         # Upsample latents

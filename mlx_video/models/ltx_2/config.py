@@ -144,6 +144,18 @@ class LTXModelConfig(BaseModelConfig):
     # removal of caption_projection
     has_prompt_adaln: bool = False
 
+    # LTX-2.5: the *video* FFN carries no bias (config ff_bias=false);
+    # the audio FFN keeps its biases (audio_ff_bias stays true).
+    ff_bias: bool = True
+    audio_ff_bias: bool = True
+    # LTX-2.5: a zero-init (1, inner_dim) keyframe-conditioning slot that
+    # must exist for strict loading; zero keeps it an exact no-op.
+    use_keyframes_abs_pos_embedding: bool = False
+    # Architecture generation as a string ("2", "2.3", "2.5"). Written by
+    # the converter; drives version-gated sampling (the distilled pipeline
+    # switches stage 1 to an ancestral sampler from 2.5 on).
+    arch_version: str = ""
+
     # VAE config
     vae_config: Optional[VideoVAEConfig] = None
 
