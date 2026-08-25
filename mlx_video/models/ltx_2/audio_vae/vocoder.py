@@ -701,15 +701,65 @@ def load_vocoder(model_path: Path) -> nn.Module:
         return model
 
 
+#: The combined vocoder+BWE checkpoint's actual architecture. 2.5-era model
+#: directories nest these parameters in config.json; 2.3-era directories
+#: ship the SAME checkpoint (verified tensor-for-tensor: 1227 tensors,
+#: identical shapes) under a marker config -- {"type": "bigvgan",
+#: "has_bwe_generator": true} -- with no architecture at all. Building that
+#: case from the dataclass defaults (5 stages, 1024 channels, snake) made a
+#: module whose weights silently failed to load and whose forward died at
+#: conv_post (48 channels into a 24-channel conv); a marker config gets the
+#: real architecture instead.
+_COMBINED_VOCODER_ARCH = {
+    "upsample_initial_channel": 1536,
+    "resblock": "AMP1",
+    "upsample_rates": [5, 2, 2, 2, 2, 2],
+    "resblock_kernel_sizes": [3, 7, 11],
+    "upsample_kernel_sizes": [11, 4, 4, 4, 4, 4],
+    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+    "stereo": True,
+    "use_tanh_at_final": False,
+    "activation": "snakebeta",
+    "use_bias_at_final": False,
+}
+_COMBINED_BWE_ARCH = {
+    "upsample_initial_channel": 512,
+    "resblock": "AMP1",
+    "upsample_rates": [6, 5, 2, 2, 2],
+    "resblock_kernel_sizes": [3, 7, 11],
+    "upsample_kernel_sizes": [12, 11, 4, 4, 4],
+    "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+    "stereo": True,
+    "use_tanh_at_final": False,
+    "activation": "snakebeta",
+    "use_bias_at_final": False,
+    "apply_final_activation": False,
+    "input_sampling_rate": 16000,
+    "output_sampling_rate": 48000,
+    "hop_length": 80,
+    "n_fft": 512,
+    "win_size": 512,
+    "num_mels": 64,
+}
+
+
+def _combined_configs(config_dict: dict) -> tuple[dict, dict]:
+    """The vocoder/bwe architecture for a combined checkpoint: the nested
+    configs when the directory carries them, the known architecture above
+    when the config is only a marker."""
+    return (
+        config_dict.get("vocoder") or _COMBINED_VOCODER_ARCH,
+        config_dict.get("bwe") or _COMBINED_BWE_ARCH,
+    )
+
+
 def _load_vocoder_with_bwe(config_dict: dict, weights: dict) -> VocoderWithBWE:
     """Load VocoderWithBWE from config and weights."""
-    # Build vocoder from config
-    vocoder_cfg = config_dict.get("vocoder", {})
+    vocoder_cfg, bwe_cfg = _combined_configs(config_dict)
+
     vocoder_config = VocoderModelConfig.from_dict(vocoder_cfg)
     vocoder = Vocoder(vocoder_config)
 
-    # Build BWE generator from config
-    bwe_cfg = config_dict.get("bwe", {})
     bwe_config = VocoderModelConfig.from_dict(bwe_cfg)
     bwe_config.apply_final_activation = False
     bwe_generator = Vocoder(bwe_config)
@@ -740,5 +790,31 @@ def _load_vocoder_with_bwe(config_dict: dict, weights: dict) -> VocoderWithBWE:
         hop_length=hop_length,
     )
 
+    # Explicit reconciliation instead of strict=False: the lax load
+    # silently skipped every tensor a wrongly-built module could not place
+    # (and placed name-matches without shape checks), deferring the failure
+    # to a conv-shape crash mid-render. strict=True is one buffer too
+    # blunt: resampler.filter is constructed at init and never shipped.
+    # Everything else must match name AND shape exactly.
+    from mlx.utils import tree_flatten
+
+    constructed = {"resampler.filter"}
+    module_shapes = {
+        key: tuple(value.shape) for key, value in tree_flatten(model.parameters())
+    }
+    unexpected = sorted(set(weights) - set(module_shapes))
+    missing = sorted(set(module_shapes) - set(weights) - constructed)
+    mismatched = sorted(
+        key
+        for key, value in weights.items()
+        if key in module_shapes and module_shapes[key] != tuple(value.shape)
+    )
+    if unexpected or missing or mismatched:
+        raise ValueError(
+            "combined vocoder checkpoint does not match its module: "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:3]}), "
+            f"{len(missing)} missing (e.g. {missing[:3]}), "
+            f"{len(mismatched)} shape mismatches (e.g. {mismatched[:3]})"
+        )
     model.load_weights(list(weights.items()), strict=False)
     return model
