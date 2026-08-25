@@ -1,9 +1,10 @@
-"""Tests for LTX-2 dev model generation pipeline."""
+"""Tests for the LTX-2 generation pipeline (once generate_dev.py, now
+consolidated into models/ltx_2/generate.py — the tests moved with it)."""
 
 import mlx.core as mx
 import pytest
 
-from mlx_video.generate_dev import (
+from mlx_video.models.ltx_2.generate import (
     AUDIO_LATENTS_PER_SECOND,
     AUDIO_SAMPLE_RATE,
     DEFAULT_NEGATIVE_PROMPT,
@@ -285,19 +286,22 @@ class TestDenoiseWithCFGMocked:
 class TestTilingDefault:
     """Tests for tiling default behavior."""
 
-    def test_tiling_default_is_none(self):
-        """Default tiling should be 'none' for performance."""
+    def test_tiling_default_is_auto(self):
+        """Default tiling is 'auto': the consolidated pipeline (ac67ee8)
+        sizes tiling from the request instead of the dev path's old
+        'none for performance' doctrine, and this pins the shipped
+        contract rather than the fossil."""
         import inspect
 
-        from mlx_video.generate_dev import generate_video_dev
+        from mlx_video.models.ltx_2.generate import generate_video
 
-        sig = inspect.signature(generate_video_dev)
+        sig = inspect.signature(generate_video)
 
         tiling_param = sig.parameters.get("tiling")
         assert tiling_param is not None
         assert (
-            tiling_param.default == "none"
-        ), f"Expected default tiling='none', got '{tiling_param.default}'"
+            tiling_param.default == "auto"
+        ), f"Expected default tiling='auto', got '{tiling_param.default}'"
 
 
 class TestLatentDimensions:

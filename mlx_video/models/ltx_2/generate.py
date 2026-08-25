@@ -29,6 +29,10 @@ from rich.progress import (
 console = Console()
 
 ProgressCallback = Callable[[int, int, str], None] | None
+#: Like ProgressCallback but handed the CURRENT latents each step, for
+#: callers that render denoise previews. Separate on purpose: latents are
+#: device arrays a progress bar has no business receiving.
+PreviewCallback = Callable[["mx.array", int, int, str], None] | None
 
 
 from mlx_video.models.ltx_2.conditioning import (
@@ -505,6 +509,7 @@ def denoise_distilled(
     audio_frozen: bool = False,
     progress_callback: ProgressCallback = None,
     callback_stage: str = "denoise",
+    preview_callback: PreviewCallback = None,
     ancestral: bool = False,
     noise_seed: int = 0,
 ) -> tuple[mx.array, Optional[mx.array]]:
@@ -687,6 +692,8 @@ def denoise_distilled(
             progress.advance(task)
             if progress_callback:
                 progress_callback(i + 1, num_steps, callback_stage)
+            if preview_callback:
+                preview_callback(latents, i + 1, num_steps, callback_stage)
 
     return latents.astype(dtype), audio_latents.astype(dtype) if enable_audio else None
 
@@ -714,6 +721,7 @@ def denoise_dev(
     stg_blocks: Optional[list] = None,
     progress_callback: ProgressCallback = None,
     callback_stage: str = "denoise",
+    preview_callback: PreviewCallback = None,
 ) -> mx.array:
     """Run denoising loop for dev pipeline with CFG/APG and optional STG guidance.
 
@@ -901,6 +909,8 @@ def denoise_dev(
             progress.advance(task)
             if progress_callback:
                 progress_callback(i + 1, num_steps, callback_stage)
+            if preview_callback:
+                preview_callback(latents, i + 1, num_steps, callback_stage)
 
     return latents.astype(dtype)
 
@@ -931,6 +941,7 @@ def denoise_dev_av(
     audio_frozen: bool = False,
     progress_callback: ProgressCallback = None,
     callback_stage: str = "denoise",
+    preview_callback: PreviewCallback = None,
 ) -> tuple[mx.array, mx.array]:
     """Run denoising loop for dev pipeline with CFG/APG, STG, modality guidance, and audio.
 
@@ -1252,6 +1263,8 @@ def denoise_dev_av(
             progress.advance(task)
             if progress_callback:
                 progress_callback(i + 1, num_steps, callback_stage)
+            if preview_callback:
+                preview_callback(video_latents, i + 1, num_steps, callback_stage)
 
     return video_latents, audio_latents
 
@@ -1283,6 +1296,7 @@ def denoise_res2s_av(
     audio_frozen: bool = False,
     progress_callback: ProgressCallback = None,
     callback_stage: str = "denoise",
+    preview_callback: PreviewCallback = None,
 ) -> tuple[mx.array, mx.array]:
     """Run res_2s second-order denoising loop with CFG/STG/modality guidance.
 
@@ -1666,6 +1680,8 @@ def denoise_res2s_av(
             progress.advance(task)
             if progress_callback:
                 progress_callback(step_idx + 1, n_full_steps, callback_stage)
+            if preview_callback:
+                preview_callback(video_latents, step_idx + 1, n_full_steps, callback_stage)
 
     # Final clean step if original schedule ended at 0
     if sigmas.tolist()[-1] == 0:

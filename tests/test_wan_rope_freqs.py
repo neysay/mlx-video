@@ -231,12 +231,11 @@ class TestRoPEFrequencyMatchesReference:
 
     @pytest.fixture
     def has_torch(self):
-        try:
-            pass
-
-            return True
-        except ImportError:
-            pytest.skip("PyTorch not installed")
+        # importorskip, not a bare import in a try: an "unused import" is
+        # exactly what formatters strip, and a stripped guard skips nothing
+        # while promising it does — this fixture used to be try: pass.
+        pytest.importorskip("torch")
+        return True
 
     def test_freqs_match_pytorch_reference(self, has_torch):
         """Numerically compare MLX and PyTorch frequency tables."""

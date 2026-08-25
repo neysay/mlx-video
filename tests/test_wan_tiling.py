@@ -5,9 +5,14 @@ import numpy as np
 
 from mlx_video.models.ltx_2.video_vae.tiling import (
     TilingConfig,
-    decode_with_tiling,
     split_in_spatial,
 )
+
+# The Wan-specific wrapper is the one that knows causal_temporal; the LTX
+# decode_with_tiling has no such argument, and importing it here is how
+# this file's own subject went untested. Its default (causal_temporal=True)
+# is exactly the LTX behavior, so every other test is unchanged.
+from mlx_video.models.wan_2.tiling import decode_with_tiling
 
 
 class TestNonCausalTemporal:
