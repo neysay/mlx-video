@@ -683,7 +683,14 @@ def load_vocoder(model_path: Path) -> nn.Module:
 
     weights = mx.load(str(model_path / "model.safetensors"))
 
-    has_bwe = config_dict.get("has_bwe_generator", False)
+    # Route on the flag OR the structure: converters have written nested
+    # {vocoder, bwe} configs without the flag (every 2.5 model on disk),
+    # and building a simple Vocoder against a combined BWE checkpoint dies
+    # in the strict load with 1227 unknown parameters. The config's own
+    # shape is evidence enough.
+    has_bwe = config_dict.get("has_bwe_generator", False) or (
+        "bwe" in config_dict and "vocoder" in config_dict
+    )
 
     if has_bwe:
         return _load_vocoder_with_bwe(config_dict, weights)

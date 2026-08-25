@@ -201,9 +201,11 @@ def audio_configs_from_metadata(meta_config: dict) -> tuple[dict, dict, dict]:
     """(decoder, encoder, vocoder) configs.
 
     The audio family is unchanged from 2.3, so the proven constant configs
-    from convert.py apply; the vocoder config is carried from the checkpoint
-    verbatim because it already has the nested {vocoder, bwe} structure the
-    BWE loader reads.
+    from convert.py apply. The vocoder config keeps the checkpoint's nested
+    {vocoder, bwe} structure AND carries ``has_bwe_generator`` explicitly:
+    load_vocoder routes on the flag, not the structure, and a nested config
+    written without it sent every 2.5 model down the simple-Vocoder branch,
+    where the strict load rejected all 1227 combined-checkpoint parameters.
     """
     from mlx_video.models.ltx_2.convert import (
         infer_audio_encoder_config,
@@ -212,7 +214,8 @@ def audio_configs_from_metadata(meta_config: dict) -> tuple[dict, dict, dict]:
 
     vocoder = meta_config.get("vocoder", {})
     if not isinstance(vocoder, dict) or "vocoder" not in vocoder:
-        vocoder = {"type": "bigvgan", "has_bwe_generator": True, **vocoder}
+        vocoder = {"type": "bigvgan", **vocoder}
+    vocoder.setdefault("has_bwe_generator", True)
     return infer_audio_vae_config({}), infer_audio_encoder_config({}), vocoder
 
 
