@@ -370,8 +370,11 @@ class STFTFn(nn.Module):
 
         left_pad = max(0, self.win_length - self.hop_length)
         if left_pad > 0:
-            first = mx.repeat(y[:, :1, :], left_pad, axis=1)
-            y = mx.concatenate([first, y], axis=1)
+            # Zero padding, matching the reference _STFTFn (F.pad's
+            # default): replicating the first sample tinted the opening
+            # frames' mel with energy the training data never had there.
+            zeros = mx.zeros((y.shape[0], left_pad, y.shape[2]), dtype=y.dtype)
+            y = mx.concatenate([zeros, y], axis=1)
 
         # forward_basis: (514, 1, 512) PyTorch format -> (514, 512, 1) MLX
         basis = mx.transpose(
@@ -634,6 +637,12 @@ class VocoderWithBWE(nn.Module):
         Returns:
             Waveform (B, out_channels, T_audio) at output_sampling_rate.
         """
+        # The whole pass runs in fp32 regardless of the caller's dtype --
+        # the mel usually arrives bf16 from a bf16 audio decoder, and bf16
+        # through this chain is the reference implementation's documented
+        # 40-90% spectral degradation. Weights are fp32 from load; casting
+        # the input keeps every downstream astype(x.dtype) at fp32 too.
+        mel_spec = mel_spec.astype(mx.float32)
         x = self.vocoder(mel_spec)  # (B, C, T) at input_sampling_rate
         _, _, length_low_rate = x.shape
         output_length = (
@@ -698,6 +707,12 @@ def load_vocoder(model_path: Path) -> nn.Module:
         config = VocoderModelConfig.from_dict(config_dict)
         model = Vocoder(config)
         model.load_weights(list(weights.items()), strict=True)
+        # Checkpoints ship bf16; the vocoder must COMPUTE in fp32. The
+        # reference implementation forces the whole forward to fp32:
+        # bf16 accumulation compounds through the ~108 sequential
+        # convolutions and degrades spectral metrics by 40-90% (audible
+        # as broadband hiss). The model is small; hold it in fp32.
+        model.set_dtype(mx.float32)
         return model
 
 
@@ -817,4 +832,6 @@ def _load_vocoder_with_bwe(config_dict: dict, weights: dict) -> VocoderWithBWE:
             f"{len(mismatched)} shape mismatches (e.g. {mismatched[:3]})"
         )
     model.load_weights(list(weights.items()), strict=False)
+    # bf16 checkpoint, fp32 compute -- see load_vocoder's simple branch.
+    model.set_dtype(mx.float32)
     return model

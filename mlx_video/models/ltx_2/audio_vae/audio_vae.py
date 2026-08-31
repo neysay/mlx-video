@@ -419,6 +419,11 @@ class AudioDecoder(nn.Module):
         weights = mx.load(str(model_path / "model.safetensors"))
         # weights = decoder.sanitize(weights)
         decoder.load_weights(list(weights.items()), strict=True)
+        # bf16 checkpoint, fp32 compute: this decoder feeds the vocoder+BWE
+        # chain, which the reference implementation runs entirely in fp32
+        # (bf16 accumulation degrades spectral metrics 40-90%). Small
+        # model; hold it in fp32 so the mel arrives clean.
+        decoder.set_dtype(mx.float32)
         return decoder
 
     def __call__(self, sample: mx.array) -> mx.array:
