@@ -301,3 +301,56 @@ def prepare_image_for_encoding(
     image = mx.expand_dims(image, axis=2)  # (1, 3, 1, H, W)
 
     return image.astype(dtype)
+
+
+def load_video_for_encoding(
+    video_path: Union[str, Path],
+    target_height: int,
+    target_width: int,
+    max_frames: Optional[int] = None,
+    dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """Read a video clip and prepare it for the LTX video VAE encoder.
+
+    Frames are resized with area interpolation (what Lightricks' IC-LoRA
+    pipeline uses for a reference video) and the count is trimmed to the
+    VAE's ``8k + 1`` rule by dropping the tail, as ComfyUI's guide node does.
+
+    Args:
+        video_path: Any container OpenCV can open.
+        target_height: Output height (multiple of 32).
+        target_width: Output width (multiple of 32).
+        max_frames: Optional cap on the frames read (before the 8k+1 trim).
+
+    Returns:
+        Tensor of shape (1, 3, F, H, W) in range [-1, 1] with F = 8k + 1.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise FileNotFoundError(f"could not open video: {video_path}")
+    frames = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if frame.shape[0] != target_height or frame.shape[1] != target_width:
+            frame = cv2.resize(
+                frame, (target_width, target_height), interpolation=cv2.INTER_AREA
+            )
+        frames.append(frame)
+        if max_frames is not None and len(frames) >= max_frames:
+            break
+    cap.release()
+    if not frames:
+        raise ValueError(f"no frames decoded from {video_path}")
+
+    keep = ((len(frames) - 1) // 8) * 8 + 1
+    frames = frames[:keep]
+
+    video = np.stack(frames).astype(np.float32) / 255.0  # (F, H, W, 3)
+    video = video * 2.0 - 1.0
+    video = np.transpose(video, (3, 0, 1, 2))[np.newaxis]  # (1, 3, F, H, W)
+    return mx.array(video, dtype=dtype)

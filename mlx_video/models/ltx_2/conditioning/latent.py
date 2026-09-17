@@ -199,3 +199,76 @@ def add_noise_with_state(
     state.latent = noise * effective_scale + state.latent * (one - effective_scale)
 
     return state
+
+
+# ---------------------------------------------------------------------------
+# In-context reference conditioning (IC-LoRA)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VideoConditionByReferenceLatent:
+    """Condition generation on a reference video read *in context* (IC-LoRA).
+
+    The reference latent is flattened to tokens and appended after the
+    target's tokens on the sequence axis for every transformer call; it is
+    never denoised and is sliced off again before the x0 step. This mirrors
+    ``ltx_core.conditioning.types.reference_video_cond`` in Lightricks'
+    LTX-2 reference implementation.
+
+    Args:
+        latent: Encoded reference video, shape (B, C, F', H', W'). Spatially it
+            is the target's latent grid divided by ``downscale_factor`` (the
+            adapter's ``reference_downscale_factor`` metadata).
+        downscale_factor: How much smaller the reference is than the target,
+            per axis. Its RoPE positions are multiplied by this so a reference
+            token sits at the same pixel coordinate as the target region it
+            describes.
+        temporal_scale_factor: Temporal subsampling of the reference. Only 1 is
+            supported for now.
+        strength: 1.0 keeps the reference tokens clean (timestep 0). Lower
+            values noise them like the target (timestep ``sigma * (1 - strength)``).
+    """
+
+    latent: mx.array
+    downscale_factor: int = 1
+    temporal_scale_factor: int = 1
+    strength: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.latent.ndim != 5:
+            raise ValueError(
+                f"reference latent must be (B, C, F, H, W), got shape {self.latent.shape}"
+            )
+        if self.downscale_factor < 1:
+            raise ValueError("downscale_factor must be >= 1")
+        if self.temporal_scale_factor != 1:
+            raise NotImplementedError(
+                "temporal_scale_factor != 1 is not supported by the in-context path yet"
+            )
+        if not 0.0 <= self.strength <= 1.0:
+            raise ValueError("strength must be in [0, 1]")
+
+
+@dataclass
+class ReferenceContext:
+    """A reference video prepared for the transformer's sequence axis.
+
+    Built once per denoise call (see ``generate.build_reference_context``) and
+    concatenated after the target tokens on every step.
+
+    Attributes:
+        tokens: Reference tokens, (B, M, C) -- the flattened clean latent.
+        positions: RoPE positions for those tokens, (B, 3, M, 2), in the
+            target's pixel space (already scaled by the downscale factor).
+        denoise_mask: Per-token mask (B, M), ``1 - strength``; multiplied by
+            the step's sigma to give each reference token its timestep.
+    """
+
+    tokens: mx.array
+    positions: mx.array
+    denoise_mask: mx.array
+
+    @property
+    def num_tokens(self) -> int:
+        return int(self.tokens.shape[1])

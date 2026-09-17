@@ -39,7 +39,12 @@ from mlx_video.models.ltx_2.conditioning import (
     VideoConditionByLatentIndex,
     apply_conditioning,
 )
-from mlx_video.models.ltx_2.conditioning.latent import LatentState, apply_denoise_mask
+from mlx_video.models.ltx_2.conditioning.latent import (
+    LatentState,
+    ReferenceContext,
+    VideoConditionByReferenceLatent,
+    apply_denoise_mask,
+)
 from mlx_video.models.ltx_2.ltx_2 import LTXModel
 from mlx_video.models.ltx_2.transformer import Modality
 from mlx_video.models.ltx_2.upsampler import load_upsampler, upsample_latents
@@ -454,6 +459,96 @@ def create_position_grid(
     return positions_bf16.astype(mx.float32)
 
 
+def create_reference_position_grid(
+    batch_size: int,
+    num_frames: int,
+    height: int,
+    width: int,
+    downscale_factor: int = 1,
+    temporal_scale: int = 8,
+    spatial_scale: int = 32,
+    fps: float = 24.0,
+    causal_fix: bool = True,
+) -> mx.array:
+    """Position grid for in-context reference tokens (IC-LoRA).
+
+    Same construction as :func:`create_position_grid` on the *reference's* own
+    latent grid, then the spatial axes are multiplied by ``downscale_factor``
+    so each reference token lands on the pixel coordinate of the target
+    region it describes (a 2x-downscaled reference token at latent (h, w)
+    coincides with the target token at latent (2h, 2w)). Mirrors
+    ``VideoConditionByReferenceLatent`` in Lightricks' ltx-core.
+    """
+    positions = create_position_grid(
+        batch_size,
+        num_frames,
+        height,
+        width,
+        temporal_scale=temporal_scale,
+        spatial_scale=spatial_scale,
+        fps=fps,
+        causal_fix=causal_fix,
+    )
+    if downscale_factor == 1:
+        return positions
+    factor = mx.array(
+        [1.0, float(downscale_factor), float(downscale_factor)], dtype=positions.dtype
+    ).reshape(1, 3, 1, 1)
+    scaled = positions * factor
+    mx.eval(scaled)
+    return scaled
+
+
+def build_reference_context(
+    reference: VideoConditionByReferenceLatent,
+    dtype: mx.Dtype,
+    fps: float = 24.0,
+) -> ReferenceContext:
+    """Flatten a reference latent into tokens + positions + mask for denoising."""
+    lat = reference.latent
+    b, c, f, h, w = lat.shape
+    tokens = mx.transpose(mx.reshape(lat, (b, c, -1)), (0, 2, 1)).astype(dtype)
+    positions = create_reference_position_grid(
+        b, f, h, w, downscale_factor=reference.downscale_factor, fps=fps
+    )
+    mask = mx.full((b, f * h * w), 1.0 - reference.strength, dtype=dtype)
+    mx.eval(tokens, positions, mask)
+    return ReferenceContext(tokens=tokens, positions=positions, denoise_mask=mask)
+
+
+def read_lora_metadata(lora_path: str | Path) -> dict:
+    """Return the ``__metadata__`` block of a safetensors file (empty if none)."""
+    import json
+    import struct
+
+    with open(lora_path, "rb") as fh:
+        header_len = struct.unpack("<Q", fh.read(8))[0]
+        header = json.loads(fh.read(header_len))
+    return header.get("__metadata__") or {}
+
+
+def lora_reference_downscale_factor(lora_path: str | Path) -> int:
+    """``reference_downscale_factor`` from an IC-LoRA's metadata (default 1).
+
+    Lightricks writes it as a string ("2"); both their pipeline and ComfyUI's
+    loader read exactly this key.
+    """
+    raw = read_lora_metadata(lora_path).get("reference_downscale_factor", 1)
+    try:
+        return max(1, int(float(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def lora_reference_temporal_scale_factor(lora_path: str | Path) -> int:
+    """``reference_temporal_scale_factor`` from an IC-LoRA's metadata (default 1)."""
+    raw = read_lora_metadata(lora_path).get("reference_temporal_scale_factor", 1)
+    try:
+        return max(1, int(float(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
 def create_audio_position_grid(
     batch_size: int,
     audio_frames: int,
@@ -512,8 +607,15 @@ def denoise_distilled(
     preview_callback: PreviewCallback = None,
     ancestral: bool = False,
     noise_seed: int = 0,
+    reference: Optional[ReferenceContext] = None,
 ) -> tuple[mx.array, Optional[mx.array]]:
     """Run denoising loop for distilled pipeline (no CFG).
+
+    ``reference`` (IC-LoRA in-context conditioning) appends the reference's
+    tokens after the target's on every transformer call -- clean, at their own
+    scaled positions -- and slices the velocity back to the target before the
+    x0 step. The reference is never updated, so the state, mask and ancestral
+    renoise below are untouched by it.
 
     With ``ancestral`` (LTX-2.5+ stage 1), each step takes a deterministic
     Euler step to an intermediate ``sigma_down`` and renoises back up to
@@ -533,6 +635,10 @@ def denoise_distilled(
 
     desc = "[cyan]Denoising A/V[/]" if enable_audio else "[cyan]Denoising[/]"
     num_steps = len(sigmas) - 1
+
+    if reference is not None:
+        positions = mx.concatenate([positions, reference.positions], axis=2)
+        mx.eval(positions)
 
     with Progress(
         SpinnerColumn(),
@@ -563,9 +669,17 @@ def denoise_distilled(
             else:
                 timesteps = mx.full((b, num_tokens), sigma, dtype=dtype)
 
+            model_latents, model_timesteps = latents_flat, timesteps
+            if reference is not None:
+                model_latents = mx.concatenate(
+                    [latents_flat, reference.tokens.astype(dtype)], axis=1
+                )
+                ref_timesteps = mx.array(sigma, dtype=dtype) * reference.denoise_mask
+                model_timesteps = mx.concatenate([timesteps, ref_timesteps], axis=1)
+
             video_modality = Modality(
-                latent=latents_flat,
-                timesteps=timesteps,
+                latent=model_latents,
+                timesteps=model_timesteps,
                 positions=positions,
                 context=text_embeddings,
                 context_mask=None,
@@ -603,6 +717,9 @@ def denoise_distilled(
             velocity, audio_velocity = transformer(
                 video=video_modality, audio=audio_modality
             )
+            if reference is not None:
+                # Drop the reference tokens: they were read, never generated.
+                velocity = velocity[:, :num_tokens]
             mx.eval(velocity)
             if audio_velocity is not None:
                 mx.eval(audio_velocity)
