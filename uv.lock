@@ -1045,7 +1045,7 @@ requires-dist = [
     { name = "rich", specifier = ">=14.2.0" },
     { name = "safetensors" },
     { name = "tqdm" },
-    { name = "transformers", extras = ["tokenizers"] },
+    { name = "transformers" },
 ]
 provides-extras = ["dev"]
 
