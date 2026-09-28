@@ -5,6 +5,7 @@ Supports both distilled (two-stage with upsampling) and dev (single-stage with C
 
 import argparse
 import math
+import re
 import time
 from collections.abc import Callable
 from enum import Enum
@@ -25,16 +26,6 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-# Rich console for styled output
-console = Console()
-
-ProgressCallback = Callable[[int, int, str], None] | None
-#: Like ProgressCallback but handed the CURRENT latents each step, for
-#: callers that render denoise previews. Separate on purpose: latents are
-#: device arrays a progress bar has no business receiving.
-PreviewCallback = Callable[["mx.array", int, int, str], None] | None
-
-
 from mlx_video.models.ltx_2.conditioning import (
     VideoConditionByLatentIndex,
     apply_conditioning,
@@ -42,6 +33,7 @@ from mlx_video.models.ltx_2.conditioning import (
 from mlx_video.models.ltx_2.conditioning.latent import (
     LatentState,
     ReferenceContext,
+    VideoConditionByKeyframeIndex,
     VideoConditionByReferenceLatent,
     apply_denoise_mask,
 )
@@ -56,6 +48,15 @@ from mlx_video.utils import (
     load_image,
     prepare_image_for_encoding,
 )
+
+# Rich console for styled output
+console = Console()
+
+ProgressCallback = Callable[[int, int, str], None] | None
+#: Like ProgressCallback but handed the CURRENT latents each step, for
+#: callers that render denoise previews. Separate on purpose: latents are
+#: device arrays a progress bar has no business receiving.
+PreviewCallback = Callable[["mx.array", int, int, str], None] | None
 
 
 class PipelineType(Enum):
@@ -392,31 +393,19 @@ def ltx2_scheduler(
     return mx.array(sigmas, dtype=mx.float32)
 
 
-def create_position_grid(
+def _latent_pixel_coords(
     batch_size: int,
     num_frames: int,
     height: int,
     width: int,
     temporal_scale: int = 8,
     spatial_scale: int = 32,
-    fps: float = 24.0,
     causal_fix: bool = True,
-) -> mx.array:
-    """Create position grid for RoPE in pixel space.
+) -> np.ndarray:
+    """Pixel-space ``[start, end)`` bounds per latent patch, before the fps
+    divide: ltx-core's ``get_pixel_coords`` on a patch-size-1 grid.
 
-    Args:
-        batch_size: Batch size
-        num_frames: Number of frames (latent)
-        height: Height (latent)
-        width: Width (latent)
-        temporal_scale: VAE temporal scale factor (default 8)
-        spatial_scale: VAE spatial scale factor (default 32)
-        fps: Frames per second (default 24.0)
-        causal_fix: Apply causal fix for first frame (default True)
-
-    Returns:
-        Position grid of shape (B, 3, num_patches, 2) in pixel space
-        where dim 2 is [start, end) bounds for each patch
+    Returns float32 of shape (B, 3, num_patches, 2).
     """
     patch_size_t, patch_size_h, patch_size_w = 1, 1, 1
 
@@ -446,8 +435,12 @@ def create_position_grid(
         pixel_coords[:, 0, :, :] = np.clip(
             pixel_coords[:, 0, :, :] + 1 - temporal_scale, a_min=0, a_max=None
         )
+    return pixel_coords
 
-    # Divide temporal coords by fps
+
+def _as_model_positions(pixel_coords: np.ndarray, fps: float) -> mx.array:
+    """Divide time by fps and quantize the way the model was trained."""
+    pixel_coords = pixel_coords.copy()
     pixel_coords[:, 0, :, :] = pixel_coords[:, 0, :, :] / fps
 
     # Cast entire position grid through bfloat16 to match PyTorch's behavior.
@@ -457,6 +450,78 @@ def create_position_grid(
     positions_bf16 = mx.array(pixel_coords, dtype=mx.bfloat16)
     mx.eval(positions_bf16)
     return positions_bf16.astype(mx.float32)
+
+
+def create_position_grid(
+    batch_size: int,
+    num_frames: int,
+    height: int,
+    width: int,
+    temporal_scale: int = 8,
+    spatial_scale: int = 32,
+    fps: float = 24.0,
+    causal_fix: bool = True,
+) -> mx.array:
+    """Create position grid for RoPE in pixel space.
+
+    Args:
+        batch_size: Batch size
+        num_frames: Number of frames (latent)
+        height: Height (latent)
+        width: Width (latent)
+        temporal_scale: VAE temporal scale factor (default 8)
+        spatial_scale: VAE spatial scale factor (default 32)
+        fps: Frames per second (default 24.0)
+        causal_fix: Apply causal fix for first frame (default True)
+
+    Returns:
+        Position grid of shape (B, 3, num_patches, 2) in pixel space
+        where dim 2 is [start, end) bounds for each patch
+    """
+    pixel_coords = _latent_pixel_coords(
+        batch_size,
+        num_frames,
+        height,
+        width,
+        temporal_scale=temporal_scale,
+        spatial_scale=spatial_scale,
+        causal_fix=causal_fix,
+    )
+    return _as_model_positions(pixel_coords, fps)
+
+
+def create_keyframe_position_grid(
+    batch_size: int,
+    num_frames: int,
+    height: int,
+    width: int,
+    frame_idx: int,
+    num_pixel_frames: int = 1,
+    temporal_scale: int = 8,
+    spatial_scale: int = 32,
+    fps: float = 24.0,
+    causal_fix: bool = True,
+) -> mx.array:
+    """RoPE positions for keyframe tokens pinned at pixel frame ``frame_idx``.
+
+    ltx-core's ``VideoConditionByKeyframeIndex.apply_to``, step for step: the
+    keyframe's own latent grid in pixel space, with the causal fix only when
+    it sits at frame 0; time shifted by ``frame_idx``; a single pixel frame's
+    span narrowed to ``[t, t + 1)``; then time divided by fps.
+    """
+    pixel_coords = _latent_pixel_coords(
+        batch_size,
+        num_frames,
+        height,
+        width,
+        temporal_scale=temporal_scale,
+        spatial_scale=spatial_scale,
+        causal_fix=causal_fix and frame_idx == 0,
+    )
+    pixel_coords[:, 0, :, :] += frame_idx
+    if num_pixel_frames == 1:
+        pixel_coords[:, 0, :, 1:] = pixel_coords[:, 0, :, :1] + 1
+    return _as_model_positions(pixel_coords, fps)
 
 
 def create_reference_position_grid(
@@ -514,6 +579,111 @@ def build_reference_context(
     mask = mx.full((b, f * h * w), 1.0 - reference.strength, dtype=dtype)
     mx.eval(tokens, positions, mask)
     return ReferenceContext(tokens=tokens, positions=positions, denoise_mask=mask)
+
+
+def build_keyframe_context(
+    keyframe: VideoConditionByKeyframeIndex,
+    dtype: mx.Dtype,
+    fps: float = 24.0,
+) -> ReferenceContext:
+    """Flatten a keyframe latent into in-context tokens + positions + mask."""
+    lat = keyframe.latent
+    b, c, f, h, w = lat.shape
+    tokens = mx.transpose(mx.reshape(lat, (b, c, -1)), (0, 2, 1)).astype(dtype)
+    positions = create_keyframe_position_grid(
+        b,
+        f,
+        h,
+        w,
+        frame_idx=keyframe.frame_idx,
+        num_pixel_frames=keyframe.num_pixel_frames,
+        fps=fps,
+    )
+    mask = mx.full((b, f * h * w), 1.0 - keyframe.strength, dtype=dtype)
+    mx.eval(tokens, positions, mask)
+    return ReferenceContext(tokens=tokens, positions=positions, denoise_mask=mask)
+
+
+class InContextTransformer:
+    """An ``LTXModel`` that reads extra clean tokens in context on every call.
+
+    Wraps the model so any denoiser -- CFG, STG and modality passes included
+    -- gains in-context conditioning without threading it through each of
+    its transformer calls: the context's tokens, timesteps and positions are
+    appended to the video modality, and the returned video velocity is cut
+    back to the target's tokens. Keyframes (``build_keyframe_context``) and
+    an IC-LoRA reference (``build_reference_context``) both arrive as a
+    ``ReferenceContext``; ``combine_contexts`` merges several.
+
+    A context token's timestep is the step's sigma times its denoise mask
+    (0 when fully clean), as in ``denoise_distilled``'s reference path.
+    """
+
+    def __init__(self, transformer: LTXModel, context: ReferenceContext) -> None:
+        self._transformer = transformer
+        self._context = context
+        self._rope: dict[int, tuple] = {}
+
+    def __getattr__(self, name: str):
+        return getattr(self._transformer, name)
+
+    def _extended_rope(self, positions: mx.array, cached_for) -> tuple:
+        from mlx_video.models.ltx_2.rope import precompute_freqs_cis
+
+        key = id(cached_for)
+        if key not in self._rope:
+            t = self._transformer
+            rope = precompute_freqs_cis(
+                positions,
+                dim=t.inner_dim,
+                theta=t.positional_embedding_theta,
+                max_pos=t.positional_embedding_max_pos,
+                use_middle_indices_grid=t.use_middle_indices_grid,
+                num_attention_heads=t.num_attention_heads,
+                rope_type=t.rope_type,
+                double_precision=t.config.double_precision_rope,
+            )
+            mx.eval(rope)
+            # Keep the source alive with its entry: an id is only unique
+            # while the object it names still exists.
+            self._rope[key] = (rope, cached_for)
+        return self._rope[key][0]
+
+    def _extend(self, video: Modality) -> Modality:
+        ctx = self._context
+        dtype = video.latent.dtype
+        if video.sigma is not None:
+            sigma = video.sigma.astype(dtype).reshape(-1, 1)
+        else:
+            sigma = mx.max(video.timesteps, axis=1, keepdims=True).astype(dtype)
+        positions = mx.concatenate([video.positions, ctx.positions], axis=2)
+        rope = video.positional_embeddings
+        if rope is not None:
+            rope = self._extended_rope(positions, cached_for=rope)
+        return Modality(
+            latent=mx.concatenate([video.latent, ctx.tokens.astype(dtype)], axis=1),
+            timesteps=mx.concatenate(
+                [video.timesteps, sigma * ctx.denoise_mask.astype(dtype)], axis=1
+            ),
+            positions=positions,
+            context=video.context,
+            enabled=video.enabled,
+            context_mask=video.context_mask,
+            positional_embeddings=rope,
+            sigma=video.sigma,
+        )
+
+    def __call__(self, video: Optional[Modality] = None, audio=None, **kwargs):
+        if video is None:
+            return self._transformer(video=video, audio=audio, **kwargs)
+        num_tokens = video.latent.shape[1]
+        velocity, audio_velocity = self._transformer(
+            video=self._extend(video), audio=audio, **kwargs
+        )
+        if velocity is not None:
+            # Drop the context tokens: they were read, never generated.
+            velocity = velocity[:, :num_tokens]
+        return velocity, audio_velocity
 
 
 def read_lora_metadata(lora_path: str | Path) -> dict:
@@ -770,7 +940,11 @@ def denoise_distilled(
                     )
                     alpha_ratio = alpha_next / alpha_down
 
-                    def ancestral_step(x, x0, key):
+                    # The step's scalars bound as defaults: the closure is
+                    # built and used within one iteration, and binding says so.
+                    def ancestral_step(
+                        x, x0, key, ratio=ratio, alpha_ratio=alpha_ratio, renoise=renoise
+                    ):
                         key, sub = mx.random.split(key)
                         noise = mx.random.normal(x.shape, dtype=mx.float32, key=sub)
                         x_next = ratio * x + (1.0 - ratio) * x0
@@ -1883,8 +2057,6 @@ def mux_video_audio(video_path: Path, audio_path: Path, output_path: Path):
         console.print("[red]FFmpeg not found. Please install ffmpeg.[/]")
         return False
 
-
-import re
 
 _MONOLITHIC_PATTERN = re.compile(
     r"^ltx-[\d.]+-\d+b-(?P<variant>distilled|dev)\.safetensors$"

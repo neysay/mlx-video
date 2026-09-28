@@ -60,3 +60,22 @@ dev = [
     "pytest",
 ]
 
+
+[tool.ruff]
+# The fork's own lint gate (sayvoy canvas plan, gate G). Upstream style is
+# kept -- Optional[...] and typing.List stay, so upstream merges stay clean --
+# which is why the rule set is pyflakes, pycodestyle, isort and bugbear only.
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "B"]
+
+[tool.pytest.ini_options]
+# Warnings fail the suite (sayvoy canvas plan, gate G). The one exception is
+# third-party: sentencepiece 0.2.1's SWIG bindings trip a CPython
+# DeprecationWarning at import that only a sentencepiece release can fix.
+filterwarnings = [
+    "error",
+    "ignore:builtin type (SwigPyPacked|SwigPyObject|swigvarlink) has no __module__ attribute:DeprecationWarning",
+]

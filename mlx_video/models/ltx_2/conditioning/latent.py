@@ -272,3 +272,70 @@ class ReferenceContext:
     @property
     def num_tokens(self) -> int:
         return int(self.tokens.shape[1])
+
+
+# ---------------------------------------------------------------------------
+# Keyframe conditioning (a frame other than the first)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VideoConditionByKeyframeIndex:
+    """Pin a pixel frame other than the first to an image (an end frame, say).
+
+    A latent frame covers eight pixel frames, so only frame 0 can be
+    conditioned by replacing a latent slot (``VideoConditionByLatentIndex``).
+    Any other frame is conditioned the way Lightricks' ltx-core does it
+    (``ltx_core.conditioning.types.keyframe_cond``): the image's clean latent
+    tokens are appended to the sequence with RoPE positions at that pixel
+    frame's time, read in context by every transformer call, and sliced off
+    before the x0 step. ``build_keyframe_context`` turns this into a
+    :class:`ReferenceContext`, so it rides the same in-context path as the
+    IC-LoRA reference and the two combine.
+
+    Args:
+        latent: Encoded keyframe, shape (B, C, F', H, W) -- the target's latent
+            grid (F' = 1 for a still).
+        frame_idx: The PIXEL frame it pins (``num_frames - 1`` for the last).
+        strength: 1.0 keeps the keyframe tokens clean (timestep 0), exactly as
+            upstream. Lower values give them the timestep ``sigma * (1 -
+            strength)``; unlike upstream, the tokens are never re-denoised, so
+            below 1.0 this is an approximation of ltx-core, not a copy.
+        num_pixel_frames: Pixel frames the latent encodes (1 for a still). A
+            single frame's temporal span is narrowed to [t, t + 1), as upstream.
+    """
+
+    latent: mx.array
+    frame_idx: int
+    strength: float = 1.0
+    num_pixel_frames: int = 1
+
+    def __post_init__(self) -> None:
+        if self.latent.ndim != 5:
+            raise ValueError(
+                f"keyframe latent must be (B, C, F, H, W), got shape {self.latent.shape}"
+            )
+        if self.frame_idx < 0:
+            raise ValueError("frame_idx must be >= 0")
+        if not 0.0 <= self.strength <= 1.0:
+            raise ValueError("strength must be in [0, 1]")
+        if self.num_pixel_frames < 1:
+            raise ValueError("num_pixel_frames must be >= 1")
+
+
+def combine_contexts(contexts: List[ReferenceContext]) -> Optional[ReferenceContext]:
+    """Several in-context sources as one (an IC reference plus keyframes).
+
+    Concatenated on the token axis in the order given; each keeps its own
+    positions and mask, so attention sees every source where it belongs.
+    ``None`` for an empty list, so callers can pass the result straight on.
+    """
+    if not contexts:
+        return None
+    if len(contexts) == 1:
+        return contexts[0]
+    return ReferenceContext(
+        tokens=mx.concatenate([ctx.tokens for ctx in contexts], axis=1),
+        positions=mx.concatenate([ctx.positions for ctx in contexts], axis=2),
+        denoise_mask=mx.concatenate([ctx.denoise_mask for ctx in contexts], axis=1),
+    )
